@@ -226,3 +226,5 @@ class CSPF(C3):
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)
         self.m = nn.Sequential(*(Faster_Block(c_, c_) for _ in range(n)))
+        
+
