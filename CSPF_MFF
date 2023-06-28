@@ -1,0 +1,228 @@
+import logging
+import math
+import warnings
+from copy import copy
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
+from torch.cuda import amp
+from torch.nn import init
+
+
+class Conv(nn.Module):
+    # Standard convolution
+    default_act = nn.SiLU()  # default activation
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = self.default_act if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+    def forward_fuse(self, x):
+        return self.act(self.conv(x))
+
+class Bottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+class C3(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # act=FReLU(c2)
+        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        # self.m = nn.Sequential(*[CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)])
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
+
+# gsconv
+class GSConv(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):
+        super().__init__()
+        c_ = c2 // 2
+        self.cv1 = Conv(c1, c_, k, s, None, g, act)
+        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act)
+
+    def forward(self, x):
+        x1 = self.cv1(x)
+        x2 = torch.cat((x1, self.cv2(x1)), 1)
+        # shuffle
+        b, n, h, w = x2.data.size()
+        b_n = b * n // 2
+        y = x2.reshape(b_n, 2, h * w)
+        y = y.permute(1, 0, 2)
+        y = y.reshape(2, -1, n // 2, h, w)
+        return torch.cat((y[0], y[1]), 1)
+
+# CA
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+
+
+class h_swish(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_swish, self).__init__()
+        self.sigmoid = h_sigmoid(inplace=inplace)
+
+    def forward(self, x):
+        return x * self.sigmoid(x)
+
+
+class CAAttention(nn.Module):
+    def __init__(self, inp, reduction=32):
+        super(CAAttention, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, inp // reduction)
+
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = h_swish()
+
+        self.conv_h = nn.Conv2d(mip, inp, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, inp, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+
+        n, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        out = identity * a_w * a_h
+
+        return out
+
+from timm.models.layers import DropPath
+
+
+class Partial_conv3(nn.Module):
+    def __init__(self, dim, n_div, forward):
+        super().__init__()
+        self.dim_conv3 = dim // n_div
+        self.dim_untouched = dim - self.dim_conv3
+        self.partial_conv3 = nn.Conv2d(self.dim_conv3, self.dim_conv3, 3, 1, 1, bias=False)
+
+        if forward == 'slicing':
+            self.forward = self.forward_slicing
+        elif forward == 'split_cat':
+            self.forward = self.forward_split_cat
+        else:
+            raise NotImplementedError
+
+    def forward_slicing(self, x):
+        # only for inference
+        x = x.clone()  # !!! Keep the original input intact for the residual connection later
+        x[:, :self.dim_conv3, :, :] = self.partial_conv3(x[:, :self.dim_conv3, :, :])
+        return x
+
+    def forward_split_cat(self, x):
+        # for training/inference
+        x1, x2 = torch.split(x, [self.dim_conv3, self.dim_untouched], dim=1)
+        x1 = self.partial_conv3(x1)
+        x = torch.cat((x1, x2), 1)
+        return x
+
+
+class Faster_Block(nn.Module):
+    def __init__(self,
+                 inc,
+                 dim,
+                 n_div=4,
+                 mlp_ratio=2,
+                 drop_path=0.0,
+                 layer_scale_init_value=0.0,
+                 pconv_fw_type='split_cat'
+                 ):
+        super().__init__()
+        self.dim = dim
+        self.mlp_ratio = mlp_ratio
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.n_div = n_div
+
+        mlp_hidden_dim = int(dim * mlp_ratio)
+
+        mlp_layer = [
+            Conv(dim, mlp_hidden_dim, 1),
+            nn.Conv2d(mlp_hidden_dim, dim, 1, bias=False)
+        ]
+
+        self.mlp = nn.Sequential(*mlp_layer)
+
+        self.spatial_mixing = Partial_conv3(
+            dim,
+            n_div,
+            pconv_fw_type
+        )
+
+        self.adjust_channel = None
+        if inc != dim:
+            self.adjust_channel = Conv(inc, dim, 1)
+
+        if layer_scale_init_value > 0:
+            self.layer_scale = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+            self.forward = self.forward_layer_scale
+        else:
+            self.forward = self.forward
+
+    def forward(self, x):
+        if self.adjust_channel is not None:
+            x = self.adjust_channel(x)
+        shortcut = x
+        x = self.spatial_mixing(x)
+        x = shortcut + self.drop_path(self.mlp(x))
+        return x
+
+    def forward_layer_scale(self, x):
+        shortcut = x
+        x = self.spatial_mixing(x)
+        x = shortcut + self.drop_path(
+            self.layer_scale.unsqueeze(-1).unsqueeze(-1) * self.mlp(x))
+        return x
+
+
+class CSPF(C3):
+    # C3 module with cross-convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(Faster_Block(c_, c_) for _ in range(n)))
